@@ -20,12 +20,8 @@ BOT_TOKEN = "8424093071:AAEfQ7aY0s5PomRRHLAuGdKC17eJiUFzFHM"
 ADMIN_IDS = {133637780}
 COUNTRIES = ["Россия", "Казахстан", "Армения", "Беларусь", "Кыргызстан"]
 
-# 1) 30 секунд вместо 45
-QUESTION_SECONDS = 30
-
-# 2) Мгновенный переход на следующий вопрос сразу после ПЕРВОГО ответа
-# (если хочешь только по таймеру — поставь False)
-FAST_ADVANCE = True
+QUESTION_SECONDS = 30            # 30 секунд на вопрос
+FAST_ADVANCE = True              # мгновенно после первого ответа
 
 DB_PATH = "/tmp/quiz_antikontrafakt.db"
 PUBLIC_URL = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
@@ -48,7 +44,7 @@ class QuizState:
     last_poll_id: Optional[str] = None
     finished: bool = False
 
-# ===== SAMPLE =====
+# ===== SAMPLE (на случай отсутствия URL) =====
 SAMPLE = [
     {
         "text": "Что такое «контрафакт»?",
@@ -103,7 +99,8 @@ def _validate(payload: List[dict]) -> List[Question]:
             raise ValueError(f"Вопрос #{i}: пустой текст/мало опций")
         if any((not isinstance(o, str) or not o.strip()) for o in options):
             raise ValueError(f"Вопрос #{i}: пустые опции")
-        if any((not isinstance(ci, int)) or ci < 0 or ci >= len(options)) for ci in correct):
+        # >>> ИСПРАВЛЕНО: без лишней скобки <<<
+        if any((not isinstance(ci, int)) or ci < 0 or ci >= len(options) for ci in correct):
             raise ValueError(f"Вопрос #{i}: неверные индексы правильных ответов")
         if not multiple and len(correct) != 1:
             raise ValueError(f"Вопрос #{i}: для одиночного должен быть ровно 1 правильный")
@@ -205,7 +202,7 @@ async def send_question(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> Non
             correct_option_id=q.correct_indices[0],
             is_anonymous=False,
             allows_multiple_answers=False,
-            open_period=QUESTION_SECONDS,  # <-- 30 сек
+            open_period=QUESTION_SECONDS,  # 30 сек
             explanation=f"Ответ покажем через {QUESTION_SECONDS} сек",
         )
     else:
@@ -216,7 +213,7 @@ async def send_question(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> Non
             type=Poll.REGULAR,
             is_anonymous=False,
             allows_multiple_answers=True,
-            open_period=QUESTION_SECONDS,  # <-- 30 сек
+            open_period=QUESTION_SECONDS,  # 30 сек
         )
     st.last_poll_message_id = msg.message_id
     st.last_poll_chat_id = chat_id
@@ -337,7 +334,6 @@ async def on_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             ON CONFLICT(poll_id, user_id) DO UPDATE SET selected=excluded.selected, is_correct=excluded.is_correct, country=excluded.country
         """, (poll_id, user.id, q_index, json.dumps(selected, ensure_ascii=False), is_correct, country, int(time.time())))
 
-    # Автопереход сразу после первого ответа (если включён)
     if FAST_ADVANCE:
         st = await ensure_state(chat_id)
         if st.last_poll_id == poll_id and not st.finished:
@@ -372,7 +368,7 @@ async def cmd_begin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     st.last_poll_chat_id = None
     st.last_poll_id = None
     st.finished = False
-    # РАНЬШЕ нужно было /next, теперь — сразу задаём первый вопрос:
+    # СРАЗУ отправляем первый вопрос
     await send_question(update.effective_chat.id, context)
 
 async def cmd_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
