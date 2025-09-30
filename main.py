@@ -23,7 +23,7 @@ COUNTRIES = ["Россия", "Казахстан", "Армения", "Белар
 # 1) 30 секунд вместо 45
 QUESTION_SECONDS = 30
 
-# Мгновенный переход на следующий вопрос сразу после первого ответа
+# 2) Мгновенный переход на следующий вопрос сразу после ПЕРВОГО ответа
 # (если хочешь только по таймеру — поставь False)
 FAST_ADVANCE = True
 
@@ -48,7 +48,7 @@ class QuizState:
     last_poll_id: Optional[str] = None
     finished: bool = False
 
-# ===== SAMPLE (на случай отсутствия URL) =====
+# ===== SAMPLE =====
 SAMPLE = [
     {
         "text": "Что такое «контрафакт»?",
@@ -79,8 +79,8 @@ def db() -> sqlite3.Connection:
             poll_id TEXT,
             user_id INTEGER,
             question_index INTEGER,
-            selected TEXT,             -- JSON list of indices
-            is_correct INTEGER,        -- 0/1
+            selected TEXT,
+            is_correct INTEGER,
             country TEXT,
             ts INTEGER,
             PRIMARY KEY (poll_id, user_id)
@@ -88,7 +88,7 @@ def db() -> sqlite3.Connection:
     """)
     return conn
 
-def is_admin(uid: int) -> bool: 
+def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
 # ===== QUESTIONS LOADING =====
@@ -115,7 +115,7 @@ def _write_cache(raw: List[dict]) -> None:
         json.dump(raw, f, ensure_ascii=False, indent=2)
 
 def _read_cache() -> Optional[List[Question]]:
-    if not os.path.exists(QUESTIONS_CACHE): 
+    if not os.path.exists(QUESTIONS_CACHE):
         return None
     try:
         with open(QUESTIONS_CACHE, "r", encoding="utf-8") as f:
@@ -135,7 +135,7 @@ def fetch_from_url(url: str) -> List[Question]:
 
 def ensure_loaded() -> None:
     global QUESTIONS
-    if QUESTIONS: 
+    if QUESTIONS:
         return
     if QUESTIONS_URL:
         try:
@@ -149,14 +149,14 @@ def ensure_loaded() -> None:
     QUESTIONS = _validate(SAMPLE)
     print("Loaded SAMPLE:", len(QUESTIONS), flush=True)
 
-# ===== HELPERS =====
+# ===== HELPERS / FLOW =====
 async def ensure_state(chat_id: int) -> QuizState:
     if chat_id not in CHAT_STATE:
         CHAT_STATE[chat_id] = QuizState(index=0)
     return CHAT_STATE[chat_id]
 
 async def schedule_close_and_next(context: ContextTypes.DEFAULT_TYPE, chat_id: int, poll_message_id: int):
-    # через 30 сек закрыть и перейти дальше (если еще актуально)
+    # авто-закрыть через 30 сек и перейти дальше, если опрос ещё актуален
     await context.application.job_queue.run_once(
         callback=advance_job,
         when=QUESTION_SECONDS + 1,
@@ -171,7 +171,6 @@ async def advance_job(context: ContextTypes.DEFAULT_TYPE):
     if chat_id is None or message_id is None:
         return
     st = await ensure_state(chat_id)
-    # если этот опрос все еще активный — закрываем и идем дальше
     if st.last_poll_message_id == message_id and not st.finished:
         try:
             await context.bot.stop_poll(chat_id=st.last_poll_chat_id, message_id=st.last_poll_message_id)
@@ -206,7 +205,7 @@ async def send_question(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> Non
             correct_option_id=q.correct_indices[0],
             is_anonymous=False,
             allows_multiple_answers=False,
-            open_period=QUESTION_SECONDS,
+            open_period=QUESTION_SECONDS,  # <-- 30 сек
             explanation=f"Ответ покажем через {QUESTION_SECONDS} сек",
         )
     else:
@@ -217,7 +216,7 @@ async def send_question(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> Non
             type=Poll.REGULAR,
             is_anonymous=False,
             allows_multiple_answers=True,
-            open_period=QUESTION_SECONDS,
+            open_period=QUESTION_SECONDS,  # <-- 30 сек
         )
     st.last_poll_message_id = msg.message_id
     st.last_poll_chat_id = chat_id
@@ -233,7 +232,6 @@ def export_excel(path: str):
 
     with db() as conn:
         cur = conn.cursor()
-        # Всего
         cur.execute("SELECT COUNT(DISTINCT user_id) FROM votes")
         total_participants = cur.fetchone()[0] or 0
         cur.execute("SELECT COUNT(*) FROM votes")
@@ -242,7 +240,6 @@ def export_excel(path: str):
         total_correct = cur.fetchone()[0] or 0
         total_incorrect = total_answers - total_correct
 
-        # По странам
         cur.execute("""
             SELECT COALESCE(u.country,'—') as country,
                    COUNT(DISTINCT v.user_id)   as participants,
@@ -255,7 +252,6 @@ def export_excel(path: str):
         """)
         by_country = cur.fetchall()
 
-        # По вопросам × страна
         cur.execute("""
             SELECT v.question_index,
                    COALESCE(u.country,'—') as country,
@@ -269,7 +265,6 @@ def export_excel(path: str):
         """)
         by_q_country = cur.fetchall()
 
-    # Лист Summary
     ws_sum.append(["Всего участников", total_participants])
     ws_sum.append(["Всего ответов", total_answers])
     ws_sum.append(["Правильных", total_correct])
@@ -279,7 +274,6 @@ def export_excel(path: str):
     for row in by_country:
         ws_sum.append(list(row))
 
-    # Лист ByQuestionCountry
     ws_bqc = wb.create_sheet("ByQuestionCountry")
     ws_bqc.append(["#Вопрос", "Страна", "Ответов", "Правильных", "Неправильных", "Текст вопроса"])
     def qtext(i:int)->str:
@@ -290,13 +284,11 @@ def export_excel(path: str):
     for qi, country, answers, correct, incorrect in by_q_country:
         ws_bqc.append([qi+1, country, answers or 0, correct or 0, incorrect or 0, qtext(qi)])
 
-    # Лист Questions (удобно сверяться)
     ws_q = wb.create_sheet("Questions")
     ws_q.append(["#", "Текст", "Опции", "Правильные индексы"])
     for i, q in enumerate(QUESTIONS, start=1):
         ws_q.append([i, q.text, " | ".join(q.options), ",".join(map(str, q.correct_indices))])
 
-    # Немного ширины колонок
     for ws in (ws_sum, ws_bqc, ws_q):
         for col in range(1, ws.max_column+1):
             ws.column_dimensions[get_column_letter(col)].width = 22
@@ -304,18 +296,15 @@ def export_excel(path: str):
     wb.save(path)
 
 async def send_final_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    # Excel -> админам и в чат (как файл)
     path = f"/tmp/quiz_report_{int(time.time())}.xlsx"
     export_excel(path)
     caption = "📊 Итоги викторины. Excel-отчёт по странам и вопросам."
-    # Админам
     for admin_id in ADMIN_IDS:
         try:
             with open(path, "rb") as f:
                 await context.bot.send_document(chat_id=admin_id, document=f, filename=os.path.basename(path), caption=caption)
         except Exception:
             pass
-    # В текущий чат
     try:
         with open(path, "rb") as f:
             await context.bot.send_document(chat_id=chat_id, document=f, filename=os.path.basename(path), caption=caption)
@@ -325,7 +314,7 @@ async def send_final_report(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 # ===== HANDLERS =====
 async def on_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     pa = update.poll_answer
-    if not pa: 
+    if not pa:
         return
     poll_id = pa.poll_id
     user = pa.user
@@ -337,11 +326,10 @@ async def on_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     is_correct = int(set(selected) == set(correct_set))
     country = None
     with db() as conn:
-        # страна пользователя
         cur = conn.cursor()
         cur.execute("SELECT country FROM users WHERE user_id = ?", (user.id,))
         row = cur.fetchone()
-        if row: 
+        if row:
             country = row[0]
         conn.execute("""
             INSERT INTO votes (poll_id, user_id, question_index, selected, is_correct, country, ts)
@@ -349,7 +337,7 @@ async def on_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             ON CONFLICT(poll_id, user_id) DO UPDATE SET selected=excluded.selected, is_correct=excluded.is_correct, country=excluded.country
         """, (poll_id, user.id, q_index, json.dumps(selected, ensure_ascii=False), is_correct, country, int(time.time())))
 
-    # 2) Если включен быстрый режим — закрываем опрос и сразу следующий
+    # Автопереход сразу после первого ответа (если включён)
     if FAST_ADVANCE:
         st = await ensure_state(chat_id)
         if st.last_poll_id == poll_id and not st.finished:
@@ -384,7 +372,8 @@ async def cmd_begin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     st.last_poll_chat_id = None
     st.last_poll_id = None
     st.finished = False
-    await update.message.reply_text(f"Готово. Загружено вопросов: {len(QUESTIONS)}. /next — отправить первый.")
+    # РАНЬШЕ нужно было /next, теперь — сразу задаём первый вопрос:
+    await send_question(update.effective_chat.id, context)
 
 async def cmd_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
