@@ -1,27 +1,32 @@
-import logging, os, json, sqlite3, asyncio
+import logging, os, json, sqlite3, asyncio, time
 from dataclasses import dataclass
 from typing import List, Optional
+
 from telegram import (
-    Update, InlineKeyboardMarkup, InlineKeyboardButton, Poll
+    Update, InlineKeyboardMarkup, InlineKeyboardButton
 )
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
-    ContextTypes, PollAnswerHandler
+    ContextTypes, PollAnswerHandler, Application
 )
 import openpyxl
 from openpyxl.utils import get_column_letter
 
+# ---------- ЛОГИ ----------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+log = logging.getLogger("quizbot")
 
+# ---------- КОНФИГ ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8424093071:AAEfQ7aY0s5PomRRHLAuGdKC17eJiUFzFHM")
 ADMIN_IDS = {133637780}
-
 DB_FILE = "quiz.db"
-QUESTIONS_URL = os.environ.get("QUESTIONS_URL", "")
-
 COUNTRIES = ["Россия", "Казахстан", "Армения", "Беларусь", "Кыргызстан"]
 
+# Webhooks
+PORT = int(os.environ.get("PORT", "10000"))
+PUBLIC_URL = os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL")  # Render даёт RENDER_EXTERNAL_URL
+
+# ---------- МОДЕЛИ ----------
 @dataclass
 class Question:
     text: str
@@ -29,8 +34,16 @@ class Question:
     correct: List[int]
     multiple: bool
 
-QUESTIONS: List[Question] = []
+@dataclass
+class QuizState:
+    index: int = 0
+    last_poll_id: Optional[str] = None
+    finished: bool = False
 
+QUESTIONS: List[Question] = []
+STATE: dict[int, QuizState] = {}
+
+# ---------- БАЗА ----------
 def db():
     conn = sqlite3.connect(DB_FILE)
     conn.execute("""CREATE TABLE IF NOT EXISTS users(
@@ -48,29 +61,26 @@ def db():
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-@dataclass
-class QuizState:
-    index: int = 0
-    last_poll_id: Optional[str] = None
-    finished: bool = False
+# ---------- ВОПРОСЫ ----------
+def load_questions_from_file():
+    global QUESTIONS
+    path = "questions.json"
+    if not os.path.exists(path):
+        log.error("questions.json not found")
+        QUESTIONS = []
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    QUESTIONS = [Question(q["text"], q["options"], q["correct_indices"], q["multiple"]) for q in data]
+    log.info("Loaded %d questions", len(QUESTIONS))
 
-STATE: dict[int, QuizState] = {}
-
+# ---------- СОСТОЯНИЕ ----------
 def get_state(chat_id: int) -> QuizState:
     if chat_id not in STATE:
         STATE[chat_id] = QuizState()
     return STATE[chat_id]
 
-def load_questions_from_file():
-    global QUESTIONS
-    path = "questions.json"
-    if not os.path.exists(path):
-        logger.error("questions.json not found")
-        return
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    QUESTIONS = [Question(q["text"], q["options"], q["correct_indices"], q["multiple"]) for q in data]
-
+# ---------- ОТПРАВКА ВОПРОСА ----------
 async def send_question(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     st = get_state(chat_id)
     if st.index >= len(QUESTIONS):
@@ -89,9 +99,10 @@ async def send_question(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     )
     st.last_poll_id = msg.poll.id
 
+    # Таймер 30с: если никто не ответит - двигаемся дальше
     async def timeout():
         await asyncio.sleep(30)
-        if st.last_poll_id == msg.poll.id:
+        if st.last_poll_id == msg.poll.id and not st.finished:
             await context.bot.send_message(chat_id, "⏰ Время вышло!")
             st.index += 1
             await send_question(chat_id, context)
@@ -106,6 +117,7 @@ async def finish_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(chat_id):
         await export_results(chat_id, context)
 
+# ---------- ХЕНДЛЕРЫ ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton(c, callback_data=f"set_country:{c}")] for c in COUNTRIES]
     await update.message.reply_text("Выберите страну:", reply_markup=InlineKeyboardMarkup(kb))
@@ -125,12 +137,19 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("🚀 Начать викторину", callback_data="start_quiz_now"),
                  InlineKeyboardButton("⏳ Позже", callback_data="start_quiz_later")]
             ])
-            await cq.edit_message_text(f"Страна: {country}. Начать викторину?", reply_markup=kb)
+            try:
+                await cq.edit_message_text(f"Страна: {country}. Начать викторину?", reply_markup=kb)
+            except:
+                await cq.message.reply_text(f"Страна: {country}. Начать викторину?", reply_markup=kb)
         else:
-            await cq.edit_message_text(f"Страна: {country}. Ждите старта от организатора.")
+            try:
+                await cq.edit_message_text(f"Страна: {country}. Ждите старта от организатора.")
+            except:
+                await cq.message.reply_text(f"Страна: {country}. Ждите старта от организатора.")
         return
 
     if data == "start_quiz_now":
+        await cq.answer()
         await cq.edit_message_text("Стартуем!")
         chat_id = cq.message.chat_id
         st = get_state(chat_id)
@@ -140,55 +159,79 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "start_quiz_later":
-        await cq.edit_message_text("Можно будет запустить позже командой /begin")
+        await cq.answer()
+        try:
+            await cq.edit_message_text("Можно будет запустить позже командой /start и выбором страны (для админа — появятся кнопки).")
+        except:
+            pass
         return
 
 async def on_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ans = update.poll_answer
     qid = ans.poll_id
     uid = ans.user.id
+
+    # Найти чат/состояние, где активен этот poll
+    st_chat_id = None
     st = None
-    for s in STATE.values():
+    for chat_id, s in STATE.items():
         if s.last_poll_id == qid:
+            st_chat_id = chat_id
             st = s
             break
-    if not st: return
+    if not st or st.finished:
+        return
+
     q = QUESTIONS[st.index]
-    chosen = ans.option_ids
+    chosen = ans.option_ids or []
     correct = set(chosen) == set(q.correct)
+
     with db() as conn:
         conn.execute("INSERT INTO answers(user_id,q_index,option_ids,correct) VALUES(?,?,?,?)",
-                     (uid, st.index, json.dumps(chosen), int(correct)))
-    st.index += 1
-    chat_id = ans.user.id if ans.user.id in STATE else None
-    if chat_id:
-        await send_question(chat_id, context)
+                     (uid, st.index, json.dumps(chosen, ensure_ascii=False), int(correct)))
 
+    # Быстрый авто-переход сразу после первого ответа
+    if st.last_poll_id == qid:
+        st.index += 1
+        await send_question(st_chat_id, context)
+
+# ---------- ОТЧЁТ ----------
 async def export_results(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     wb = openpyxl.Workbook()
     ws = wb.active
+    ws.title = "Answers"
     ws.append(["Страна", "Пользователь", "Вопрос", "Ответ", "Правильно"])
     with db() as conn:
-        for row in conn.execute("SELECT user_id,q_index,option_ids,correct FROM answers"):
-            uid,qidx,opt,corr = row
-            country = conn.execute("SELECT country FROM users WHERE user_id=?",(uid,)).fetchone()
-            country = country[0] if country else "?"
+        rows = conn.execute("SELECT user_id,q_index,option_ids,correct FROM answers").fetchall()
+        for uid,qidx,opt,corr in rows:
+            country_row = conn.execute("SELECT country FROM users WHERE user_id=?",(uid,)).fetchone()
+            country = country_row[0] if country_row else "?"
             ws.append([country, uid, qidx+1, opt, "Да" if corr else "Нет"])
     for col in ws.columns:
-        ws.column_dimensions[get_column_letter(col[0].column)].width = 15
-    path = "results.xlsx"
+        ws.column_dimensions[get_column_letter(col[0].column)].width = 18
+    path = f"results_{int(time.time())}.xlsx"
     wb.save(path)
-    await context.bot.send_document(chat_id, open(path,"rb"))
+    await context.bot.send_document(chat_id, open(path, "rb"), filename=os.path.basename(path))
 
-def build_app():
+# ---------- APP ----------
+def build_app() -> Application:
     load_questions_from_file()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("begin", cmd_start))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(PollAnswerHandler(on_poll_answer))
     return app
 
 if __name__ == "__main__":
     app = build_app()
-    app.run_polling()
+    path = f"/{BOT_TOKEN}"   # путь webhook
+    if not PUBLIC_URL:
+        raise RuntimeError("PUBLIC_URL/RENDER_EXTERNAL_URL is empty. On Render this is set automatically.")
+    log.info("Webhook on %s%s (port %s)", PUBLIC_URL, path, PORT)
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=path,
+        webhook_url=PUBLIC_URL + path,
+        drop_pending_updates=True,
+    )
