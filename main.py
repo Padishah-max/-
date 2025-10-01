@@ -1,6 +1,6 @@
 import logging, os, json, sqlite3, asyncio, time, threading
-from dataclasses import dataclass
-from typing import List, Optional
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Set, Tuple
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -21,7 +21,12 @@ ADMIN_IDS = {133637780}
 DB_FILE = "quiz.db"
 COUNTRIES = ["Россия", "Казахстан", "Армения", "Беларусь", "Кыргызстан"]
 
-QUESTION_SECONDS = 30
+# время на ОДИН вопрос (сек)
+QUESTION_SECONDS = 600  # 10 минут
+
+# глобальный дедлайн викторины с момента ПЕРВОГО ответа (сек)
+GLOBAL_DEADLINE_SECONDS = 600  # 10 минут
+
 PORT = int(os.environ.get("PORT", "10000"))  # Render для Web Service ожидает открытый порт
 
 # --------- МОДЕЛИ ---------
@@ -37,9 +42,12 @@ class QuizState:
     index: int = 0
     last_poll_id: Optional[str] = None
     finished: bool = False
+    # глобальный дедлайн
+    first_answer_ts: Optional[float] = None
+    deadline_task_started: bool = False
 
 QUESTIONS: List[Question] = []
-STATE: dict[int, QuizState] = {}
+STATE: Dict[int, QuizState] = {}   # chat_id -> state
 
 # --------- ЗДОРОВЬЕ (HTTP /health) ---------
 class HealthHandler(BaseHTTPRequestHandler):
@@ -53,9 +61,10 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         else:
             self.send_error(404)
+    def log_message(self, *args, **kwargs):
+        return  # тише в логах
 
 def start_health_server(port: int):
-    # Лёгкий HTTP-сервер в отдельном потоке (чтобы run_polling не блокировал)
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
@@ -98,17 +107,18 @@ def get_state(chat_id: int) -> QuizState:
         STATE[chat_id] = QuizState()
     return STATE[chat_id]
 
-# --------- ЛОГИКА ВОПРОСОВ ---------
+# --------- ОТПРАВКА ВОПРОСА ---------
 async def send_question(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     st = get_state(chat_id)
     if st.index >= len(QUESTIONS):
         await finish_quiz(chat_id, context)
         return
-
     q = QUESTIONS[st.index]
+
     title = f"Вопрос {st.index+1}/{len(QUESTIONS)}"
     suffix = " (несколько ответов)" if q.multiple else ""
-    qtext = f"{title}\n{q.text}{suffix}"
+    rules = f"\n⏱ На ответ даётся {QUESTION_SECONDS//60} минут(ы)."
+    qtext = f"{title}\n{q.text}{suffix}{rules}"
 
     msg = await context.bot.send_poll(
         chat_id=chat_id,
@@ -119,27 +129,32 @@ async def send_question(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     )
     st.last_poll_id = msg.poll.id
 
-    async def timeout():
+    # Пер-вопросный таймер (если никто не ответит — перейти дальше)
+    async def per_question_timeout(this_poll_id: str):
         await asyncio.sleep(QUESTION_SECONDS)
-        if st.last_poll_id == msg.poll.id and not st.finished:
-            await context.bot.send_message(chat_id, "⏰ Время вышло!")
+        if st.last_poll_id == this_poll_id and not st.finished:
+            await context.bot.send_message(chat_id, "⏰ Время на этот вопрос вышло!")
             st.index += 1
             await send_question(chat_id, context)
-    asyncio.create_task(timeout())
+    asyncio.create_task(per_question_timeout(msg.poll.id))
 
 async def finish_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     st = get_state(chat_id)
     if st.finished:
         return
     st.finished = True
-    await context.bot.send_message(chat_id, "✅ Викторина завершена!")
+    await context.bot.send_message(chat_id, "✅ Викторина завершена! Формирую отчёт…")
     if is_admin(chat_id):
         await export_results(chat_id, context)
 
 # --------- ХЕНДЛЕРЫ ---------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton(c, callback_data=f"set_country:{c}")] for c in COUNTRIES]
-    await update.message.reply_text("Выберите страну:", reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text(
+        "Выберите страну. После старта викторины: на каждый вопрос даётся 10 минут. "
+        "Также вся викторина автоматически завершится через 10 минут после первого ответа любого участника.",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cq = update.callback_query
@@ -169,11 +184,14 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "start_quiz_now":
         await cq.answer()
-        await cq.edit_message_text("Стартуем!")
+        await cq.edit_message_text("Стартуем! На каждый вопрос — 10 минут. "
+                                   "И вся викторина завершится через 10 минут после первого ответа.")
         chat_id = cq.message.chat_id
         st = get_state(chat_id)
         st.index = 0
         st.finished = False
+        st.first_answer_ts = None
+        st.deadline_task_started = False
         await send_question(chat_id, context)
         return
 
@@ -203,34 +221,113 @@ async def on_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     q = QUESTIONS[st.index]
     chosen = ans.option_ids or []
-    correct = set(chosen) == set(q.correct)
+    correct = int(set(chosen) == set(q.correct))
 
+    # Записываем ответ
     with db() as conn:
         conn.execute("INSERT INTO answers(user_id,q_index,option_ids,correct) VALUES(?,?,?,?)",
-                     (uid, st.index, json.dumps(chosen, ensure_ascii=False), int(correct)))
+                     (uid, st.index, json.dumps(chosen, ensure_ascii=False), correct))
 
-    # быстрый переход сразу после первого ответа
-    if st.last_poll_id == qid:
+    # Стартуем ГЛОБАЛЬНЫЙ дедлайн, если это ПЕРВЫЙ ответ
+    if st.first_answer_ts is None:
+        st.first_answer_ts = time.time()
+        if not st.deadline_task_started:
+            st.deadline_task_started = True
+            asyncio.create_task(global_deadline_watch(st_chat_id, context))
+
+    # быстрый переход сразу после первого ответа на этот вопрос
+    if st.last_poll_id == qid and not st.finished:
         st.index += 1
         await send_question(st_chat_id, context)
+
+# --------- ГЛОБАЛЬНЫЙ ДЕДЛАЙН 10 МИН ---------
+async def global_deadline_watch(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    st = get_state(chat_id)
+    await asyncio.sleep(GLOBAL_DEADLINE_SECONDS)
+    if not st.finished:
+        await context.bot.send_message(chat_id, "⏰ Общий дедлайн 10 минут истёк. Завершаем викторину.")
+        await finish_quiz(chat_id, context)
 
 # --------- ОТЧЁТ ---------
 async def export_results(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     wb = openpyxl.Workbook()
+
+    # --- Лист 1: все ответы ---
     ws = wb.active
     ws.title = "Answers"
-    ws.append(["Страна", "Пользователь", "Вопрос", "Ответ", "Правильно"])
+    ws.append(["Страна", "Пользователь", "Вопрос", "Ответ(ы) индексы", "Правильно"])
+    answers_rows: List[Tuple[int,int,str,int]] = []  # (uid, qidx, opt, corr)
+
+    countries_by_user: Dict[int, str] = {}
     with db() as conn:
-        rows = conn.execute("SELECT user_id,q_index,option_ids,correct FROM answers").fetchall()
-        for uid,qidx,opt,corr in rows:
-            country_row = conn.execute("SELECT country FROM users WHERE user_id=?",(uid,)).fetchone()
-            country = country_row[0] if country_row else "?"
-            ws.append([country, uid, qidx+1, opt, "Да" if corr else "Нет"])
+        # справочник пользователей
+        for uid, country in conn.execute("SELECT user_id,country FROM users"):
+            countries_by_user[uid] = country or "?"
+        # ответы
+        for uid,qidx,opt,corr in conn.execute("SELECT user_id,q_index,option_ids,correct FROM answers"):
+            answers_rows.append((uid,qidx,opt,corr))
+
+    for uid,qidx,opt,corr in answers_rows:
+        country = countries_by_user.get(uid, "?")
+        ws.append([country, uid, qidx+1, opt, "Да" if corr else "Нет"])
+
     for col in ws.columns:
         ws.column_dimensions[get_column_letter(col[0].column)].width = 18
+
+    # --- Лист 2: свод по странам ---
+    ws2 = wb.create_sheet("ByCountry")
+    ws2.append(["Страна", "Участников", "Всего ответов", "Правильных", "Неправильных", "Точность, %"])
+
+    # агрегируем
+    stats: Dict[str, Dict[str, int]] = {}
+    users_per_country: Dict[str, Set[int]] = {}
+
+    for uid,qidx,opt,corr in answers_rows:
+        country = countries_by_user.get(uid, "?")
+        stats.setdefault(country, {"total":0,"correct":0})
+        users_per_country.setdefault(country, set()).add(uid)
+        stats[country]["total"] += 1
+        if corr:
+            stats[country]["correct"] += 1
+
+    for country, s in stats.items():
+        total = s["total"]
+        correct = s["correct"]
+        wrong = total - correct
+        participants = len(users_per_country.get(country, set()))
+        acc = round((correct/total*100) if total else 0.0, 2)
+        ws2.append([country, participants, total, correct, wrong, acc])
+
+    for col in ws2.columns:
+        ws2.column_dimensions[get_column_letter(col[0].column)].width = 18
+
+    # --- Лист 3: свод по странам и вопросам ---
+    ws3 = wb.create_sheet("ByCountryQuestion")
+    ws3.append(["Страна", "Вопрос №", "Ответов", "Правильных", "Неправильных", "Точность, %"])
+
+    cq_stats: Dict[Tuple[str,int], Dict[str,int]] = {}
+    for uid,qidx,opt,corr in answers_rows:
+        country = countries_by_user.get(uid, "?")
+        key = (country, qidx+1)
+        d = cq_stats.setdefault(key, {"total":0,"correct":0})
+        d["total"] += 1
+        if corr:
+            d["correct"] += 1
+
+    for (country, qn), d in sorted(cq_stats.items(), key=lambda x: (x[0][0], x[0][1])):
+        total = d["total"]
+        correct = d["correct"]
+        wrong = total - correct
+        acc = round((correct/total*100) if total else 0.0, 2)
+        ws3.append([country, qn, total, correct, wrong, acc])
+
+    for col in ws3.columns:
+        ws3.column_dimensions[get_column_letter(col[0].column)].width = 18
+
     path = f"results_{int(time.time())}.xlsx"
     wb.save(path)
     await context.bot.send_document(chat_id, open(path, "rb"), filename=os.path.basename(path))
+    log.info("Results exported -> %s", path)
 
 # --------- APP ---------
 def build_app() -> Application:
@@ -242,8 +339,8 @@ def build_app() -> Application:
     return app
 
 if __name__ == "__main__":
-    # 1) поднимаем health-сервер (для Render и пингера)
+    # health-сервер для Render и пингера
     start_health_server(PORT)
-    # 2) запускаем Telegram-бота в режиме polling (без await/async здесь)
+    # polling бота
     application = build_app()
     application.run_polling(drop_pending_updates=True)
