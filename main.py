@@ -1,6 +1,7 @@
-import logging, os, json, sqlite3, asyncio, time
+import logging, os, json, sqlite3, asyncio, time, threading
 from dataclasses import dataclass
 from typing import List, Optional
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
@@ -10,19 +11,20 @@ from telegram.ext import (
 import openpyxl
 from openpyxl.utils import get_column_letter
 
-# --- ЛОГИ ---
+# --------- ЛОГИ ---------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("quizbot")
 
-# --- КОНФИГ ---
+# --------- КОНФИГ ---------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8424093071:AAEfQ7aY0s5PomRRHLAuGdKC17eJiUFzFHM")
 ADMIN_IDS = {133637780}
 DB_FILE = "quiz.db"
 COUNTRIES = ["Россия", "Казахстан", "Армения", "Беларусь", "Кыргызстан"]
 
 QUESTION_SECONDS = 30
+PORT = int(os.environ.get("PORT", "10000"))  # Render для Web Service ожидает открытый порт
 
-# --- МОДЕЛИ ---
+# --------- МОДЕЛИ ---------
 @dataclass
 class Question:
     text: str
@@ -39,7 +41,27 @@ class QuizState:
 QUESTIONS: List[Question] = []
 STATE: dict[int, QuizState] = {}
 
-# --- БАЗА ---
+# --------- ЗДОРОВЬЕ (HTTP /health) ---------
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/", "/health"):
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_error(404)
+
+def start_health_server(port: int):
+    # Лёгкий HTTP-сервер в отдельном потоке (чтобы run_polling не блокировал)
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    log.info("Health server started on :%s (/health)", port)
+
+# --------- БАЗА ---------
 def db():
     conn = sqlite3.connect(DB_FILE)
     conn.execute("""CREATE TABLE IF NOT EXISTS users(
@@ -57,7 +79,7 @@ def db():
 def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
-# --- ВОПРОСЫ ---
+# --------- ВОПРОСЫ ---------
 def load_questions_from_file():
     global QUESTIONS
     path = "questions.json"
@@ -70,22 +92,24 @@ def load_questions_from_file():
     QUESTIONS = [Question(q["text"], q["options"], q["correct_indices"], q["multiple"]) for q in data]
     log.info("Loaded %d questions", len(QUESTIONS))
 
-# --- СОСТОЯНИЕ ---
+# --------- СОСТОЯНИЕ ---------
 def get_state(chat_id: int) -> QuizState:
     if chat_id not in STATE:
         STATE[chat_id] = QuizState()
     return STATE[chat_id]
 
-# --- ВОПРОСЫ/ОТВЕТЫ ---
+# --------- ЛОГИКА ВОПРОСОВ ---------
 async def send_question(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     st = get_state(chat_id)
     if st.index >= len(QUESTIONS):
         await finish_quiz(chat_id, context)
         return
+
     q = QUESTIONS[st.index]
     title = f"Вопрос {st.index+1}/{len(QUESTIONS)}"
     suffix = " (несколько ответов)" if q.multiple else ""
     qtext = f"{title}\n{q.text}{suffix}"
+
     msg = await context.bot.send_poll(
         chat_id=chat_id,
         question=qtext,
@@ -112,7 +136,7 @@ async def finish_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(chat_id):
         await export_results(chat_id, context)
 
-# --- HANDLERS ---
+# --------- ХЕНДЛЕРЫ ---------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton(c, callback_data=f"set_country:{c}")] for c in COUNTRIES]
     await update.message.reply_text("Выберите страну:", reply_markup=InlineKeyboardMarkup(kb))
@@ -190,7 +214,7 @@ async def on_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st.index += 1
         await send_question(st_chat_id, context)
 
-# --- ОТЧЁТ ---
+# --------- ОТЧЁТ ---------
 async def export_results(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -208,22 +232,7 @@ async def export_results(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     wb.save(path)
     await context.bot.send_document(chat_id, open(path, "rb"), filename=os.path.basename(path))
 
-# --- APP + HEALTH ---
-async def start_http_health():
-    # лёгкий aiohttp-сервер на PORT для Render и пингера
-    from aiohttp import web
-    async def ok(_):
-        return web.Response(text="ok")
-    app = web.Application()
-    app.router.add_get("/", ok)
-    app.router.add_get("/health", ok)
-    port = int(os.environ.get("PORT", "10000"))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    log.info("Health server on :%s (/health)", port)
-
+# --------- APP ---------
 def build_app() -> Application:
     load_questions_from_file()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -232,20 +241,9 @@ def build_app() -> Application:
     app.add_handler(PollAnswerHandler(on_poll_answer))
     return app
 
-async def main():
-    # 1) health-сервер (порт для Render и пингера)
-    await start_http_health()
-    # 2) Telegram polling
-    application = build_app()
-    await application.initialize()
-    await application.start()
-    await application.start_polling(drop_pending_updates=True)
-    log.info("Polling started")
-    # держим процесс живым
-    await asyncio.Event().wait()
-
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    # 1) поднимаем health-сервер (для Render и пингера)
+    start_health_server(PORT)
+    # 2) запускаем Telegram-бота в режиме polling (без await/async здесь)
+    application = build_app()
+    application.run_polling(drop_pending_updates=True)
