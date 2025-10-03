@@ -17,20 +17,41 @@ from openpyxl.utils import get_column_letter
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("quizbot")
 
-# ---------- ТОЛЬКО ЧЕРЕЗ ENV ----------
+# ---------- КОНФИГ ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is empty. Set it in Render → Settings → Environment.")
 
-# Можно перечислить админов через переменную окружения: ADMINS="123,456"
 ADMIN_IDS = {int(x) for x in os.getenv("ADMINS", "").split(",") if x.strip().isdigit()} or {133637780}
-
 DB_FILE = "quiz.db"
 COUNTRIES = ["Россия", "Казахстан", "Армения", "Беларусь", "Кыргызстан"]
 QUESTIONS_FILE = "questions.json"
 QUESTION_SECONDS = 30
 DEFAULT_COUNTDOWN = 3
+
+# для Render: порт задаётся платформой
 PORT = int(os.getenv("PORT", "10000"))
+PUBLIC_URL = (os.getenv("PUBLIC_URL") or "").strip().rstrip("/")  # если есть — используем webhook
+
+# ---------- HEALTH (/health) ----------
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/", "/health"):
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_error(404)
+    def log_message(self, *_):  # тише
+        return
+
+def start_health_server(port: int):
+    srv = HTTPServer(("0.0.0.0", port), HealthHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    log.info("Health server on :%s (/health)", port)
 
 # ---------- МОДЕЛИ ----------
 @dataclass
@@ -49,26 +70,6 @@ class UserQuizState:
 
 QUESTIONS: List[Question] = []
 STATE: Dict[int, UserQuizState] = {}
-
-# ---------- HEALTH (/health) ----------
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path in ("/", "/health"):
-            body = b"ok"
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        else:
-            self.send_error(404)
-    def log_message(self, *args, **kwargs):  # тише в логах
-        return
-
-def start_health_server(port: int):
-    srv = HTTPServer(("0.0.0.0", port), HealthHandler)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    log.info("Health server on :%s (/health)", port)
 
 # ---------- БАЗА ----------
 def db():
@@ -145,7 +146,7 @@ def reset_user(uid: int):
         conn.execute("DELETE FROM answers WHERE user_id=?", (uid,))
     STATE.pop(uid, None)
 
-# ---------- ЛОГИКА КВИЗА (личный чат) ----------
+# ---------- ЛОГИКА КВИЗА ----------
 async def start_user_quiz(uid: int, context: ContextTypes.DEFAULT_TYPE, countdown_sec: int = DEFAULT_COUNTDOWN):
     st = get_state(uid)
     if st.started and not st.finished:
@@ -204,31 +205,30 @@ async def send_next_question(uid: int, context: ContextTypes.DEFAULT_TYPE):
 # ---------- ОТЧЁТ ----------
 async def export_results_file() -> str:
     wb = openpyxl.Workbook()
-    # Лист 1: детально
     ws = wb.active
     ws.title = "Answers"
-    ws.append(["Страна", "Пользователь", "Вопрос №", "Ответ(ы) индексы", "Правильно"])
+    ws.append(["Страна","Пользователь","Вопрос №","Ответ(ы) индексы","Правильно"])
 
     answers: List[Tuple[int,int,str,int]] = []
     user_country: Dict[int, str] = {}
     with db() as conn:
-        for uid, country in conn.execute("SELECT user_id,country FROM users"):
+        for uid,country in conn.execute("SELECT user_id,country FROM users"):
             user_country[uid] = country or "?"
         for uid,qidx,opt,corr in conn.execute("SELECT user_id,q_index,option_ids,correct FROM answers"):
             answers.append((uid,qidx,opt,corr))
     for uid,qidx,opt,corr in answers:
         ws.append([user_country.get(uid,"?"), uid, qidx+1, opt, "Да" if corr else "Нет"])
+
     for col in ws.columns:
         ws.column_dimensions[get_column_letter(col[0].column)].width = 18
 
-    # Лист 2: свод по странам
     ws2 = wb.create_sheet("ByCountry")
     ws2.append(["Страна","Участников","Ответов всего","Правильных","Неправильных","Точность, %"])
     stats: Dict[str, Dict[str,int]] = {}
     users_by_country: Dict[str, Set[int]] = {}
     for uid,qidx,opt,corr in answers:
         c = user_country.get(uid,"?")
-        stats.setdefault(c, {"tot":0,"ok":0})
+        stats.setdefault(c,{"tot":0,"ok":0})
         users_by_country.setdefault(c,set()).add(uid)
         stats[c]["tot"] += 1
         if corr: stats[c]["ok"] += 1
@@ -239,12 +239,11 @@ async def export_results_file() -> str:
     for col in ws2.columns:
         ws2.column_dimensions[get_column_letter(col[0].column)].width = 18
 
-    # Лист 3: по странам и вопросам
     ws3 = wb.create_sheet("ByCountryQuestion")
     ws3.append(["Страна","Вопрос №","Ответов","Правильных","Неправильных","Точность, %"])
     cqm: Dict[Tuple[str,int], Dict[str,int]] = {}
     for uid,qidx,opt,corr in answers:
-        c = user_country.get(uid,"?")
+        c=user_country.get(uid,"?")
         key=(c,qidx+1)
         d=cqm.setdefault(key,{"tot":0,"ok":0})
         d["tot"]+=1
@@ -322,9 +321,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         country = data.split(":", 1)[1]
         uid = cq.from_user.id
 
-        # Автосброс прошлой попытки
         reset_user(uid)
-
         with db() as conn:
             conn.execute(
                 "INSERT INTO users(user_id,country) VALUES(?,?) "
@@ -349,13 +346,11 @@ async def on_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = QUESTIONS[st.index]
     chosen = ans.option_ids or []
     correct = int(set(chosen) == set(q.correct))
-
     with db() as conn:
         conn.execute(
             "INSERT INTO answers(user_id,q_index,option_ids,correct) VALUES(?,?,?,?)",
             (uid, st.index, json.dumps(chosen, ensure_ascii=False), correct)
         )
-
     st.index += 1
     await send_next_question(uid, context)
 
@@ -374,8 +369,32 @@ def build_app() -> Application:
     return app
 
 if __name__ == "__main__":
-    start_health_server(PORT)  # для Render/pinger
+    # сервер для Render/пингера
+    start_health_server(PORT)
     application = build_app()
-    # важно: polling (без webhooks) → конфликтов с вебхуком не будет
-    application.run_polling(drop_pending_updates=True,
-                            allowed_updates=["message","callback_query","poll_answer"])
+
+    if PUBLIC_URL:
+        # ---- режим WEBHOOK (никакого getUpdates → нет 409) ----
+        log.info("Running in WEBHOOK mode. PUBLIC_URL=%s", PUBLIC_URL)
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=BOT_TOKEN,                       # путь, чтобы никто случайно не угадал
+            webhook_url=f"{PUBLIC_URL}/{BOT_TOKEN}",  # адрес вебхука для Telegram
+            drop_pending_updates=True,
+            allowed_updates=["message","callback_query","poll_answer"]
+        )
+    else:
+        # ---- режим POLLING (на случай локального запуска) ----
+        log.info("Running in POLLING mode")
+        # убедимся, что вебхук снят
+        async def _run():
+            async with application:
+                await application.bot.delete_webhook(drop_pending_updates=True)
+                await application.start()
+                await application.updater.start_polling(
+                    drop_pending_updates=True,
+                    allowed_updates=["message","callback_query","poll_answer"]
+                )
+                await application.updater.wait()
+        asyncio.run(_run())
