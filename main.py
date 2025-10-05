@@ -1,4 +1,4 @@
-# main.py — версия под WEBHOOK для Render
+# main.py — режим WEBHOOK для Render, админ запускает викторину
 import os, json, sqlite3, asyncio, time, logging
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Set, Tuple
@@ -18,23 +18,26 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("quizbot")
 
 # ---------- ОКРУЖЕНИЕ ----------
-BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
-PUBLIC_URL = (os.getenv("PUBLIC_URL") or "").strip().rstrip("/")
-PORT = int(os.getenv("PORT", "10000"))   # Render задаёт порт
+BOT_TOKEN   = (os.getenv("BOT_TOKEN")   or "").strip()
+PUBLIC_URL  = (os.getenv("PUBLIC_URL")  or "").strip().rstrip("/")
+PORT        = int(os.getenv("PORT", "10000"))
+ADMINS_ENV  = os.getenv("ADMINS", "")
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is empty. Set it in Settings → Environment.")
+    raise RuntimeError("BOT_TOKEN is empty (Settings → Environment).")
 if not PUBLIC_URL:
-    raise RuntimeError("PUBLIC_URL is empty. Set it to your Render URL (https://xxx.onrender.com).")
+    raise RuntimeError("PUBLIC_URL is empty (например, https://your.onrender.com).")
 
-# Админы (опционально, через переменную окружения ADMINS="123,456")
-ADMIN_IDS = {int(x) for x in (os.getenv("ADMINS") or "").split(",") if x.strip().isdigit()} or {133637780}
+ADMIN_IDS = {int(x) for x in ADMINS_ENV.split(",") if x.strip().isdigit()} or {133637780}
 
-DB_FILE = "quiz.db"
+DB_FILE        = "quiz.db"
 QUESTIONS_FILE = "questions.json"
-COUNTRIES = ["Россия", "Казахстан", "Армения", "Беларусь", "Кыргызстан"]
+COUNTRIES      = ["Россия", "Казахстан", "Армения", "Беларусь", "Кыргызстан"]
 QUESTION_SECONDS = 30
-COUNTDOWN = 3
+COUNTDOWN         = 3
+
+# Глобальный флаг «идёт раунд»
+QUIZ_ACTIVE = False
 
 # ---------- МОДЕЛИ ----------
 @dataclass
@@ -71,6 +74,11 @@ def db():
 
 def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
+
+def get_registered_users() -> List[int]:
+    with db() as conn:
+        rows = conn.execute("SELECT user_id FROM users WHERE country IS NOT NULL").fetchall()
+    return [r[0] for r in rows]
 
 # ---------- ВОПРОСЫ ----------
 def _validate_questions(data: List[dict]) -> List[Question]:
@@ -112,7 +120,7 @@ async def set_questions_from_url(url: str) -> int:
         r = await client.get(url)
         r.raise_for_status()
         data = r.json()
-    _ = _validate_questions(data)  # проверим
+    _ = _validate_questions(data)
     with open(QUESTIONS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     return load_questions_from_file()
@@ -128,8 +136,9 @@ def reset_user(uid: int):
     with db() as conn:
         conn.execute("DELETE FROM answers WHERE user_id=?", (uid,))
 
-# ---------- ЛОГИКА КВИЗА ----------
+# ---------- КВИЗ (личный чат) ----------
 async def start_user_quiz(uid: int, ctx: ContextTypes.DEFAULT_TYPE, countdown: int = COUNTDOWN):
+    """Запустить попытку у конкретного пользователя (если активен раунд)."""
     s = st(uid)
     if s.started and not s.finished:
         return
@@ -240,34 +249,69 @@ async def export_results_file() -> str:
     wb.save(path)
     return path
 
-# ---------- КОМАНДЫ ----------
+# ---------- КОМАНДЫ (участник) ----------
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Участник выбирает страну и ждёт старта от админа."""
     if update.effective_chat.type != "private":
         await update.message.reply_text("Напишите мне в личном чате, чтобы пройти викторину.")
         return
     kb = [[InlineKeyboardButton(c, callback_data=f"set_country:{c}") ] for c in COUNTRIES]
     await update.message.reply_text(
-        f"Выберите страну. После выбора викторина начнётся автоматически.\n"
-        f"На каждый вопрос даётся {QUESTION_SECONDS} секунд.",
+        "Выберите страну. После выбора вы будете зарегистрированы и увидите сообщение: "
+        "«Ожидайте старт от организатора». Админ запустит викторину для всех зарегистрированных.",
         reply_markup=InlineKeyboardMarkup(kb)
     )
 
-async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_again(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Сброс своей попытки; ждём следующего админ-старта."""
     uid = update.effective_user.id
     reset_user(uid)
     kb = [[InlineKeyboardButton(c, callback_data=f"set_country:{c}") ] for c in COUNTRIES]
-    await update.message.reply_text("🔄 Начинаем заново. Выберите страну:", reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text(
+        "🔁 Пройти заново. Выберите страну — и ожидайте старт от организатора.",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 Личный режим викторины.\n"
-        "/start — начать (выбор страны)\n"
-        "/restart — пройти заново\n\n"
+        "🤖 Личная викторина.\n"
+        "/start — регистрация (выбор страны) и ожидание старта\n"
+        "/again — сброс своей попытки\n\n"
         "Админ:\n"
+        "/start_quiz — запустить викторину для всех зарегистрированных\n"
         "/report — Excel-отчёт\n"
         "/reload — перечитать questions.json\n"
-        "/setq <raw_json_url> — загрузить вопросы по URL"
+        "/setq <raw_json_url> — загрузить вопросы по URL\n"
+        "/status — зарегистрированные пользователи по странам"
     )
+
+# ---------- КОМАНДЫ (админ) ----------
+async def cmd_start_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """АДМИН: запустить для всех зарегистрированных, кто ещё не начал или уже сбросил."""
+    global QUIZ_ACTIVE
+    if not is_admin(update.effective_user.id):
+        return
+    if not QUESTIONS:
+        await update.message.reply_text("Нет загруженных вопросов. Используй /reload или /setq.")
+        return
+
+    QUIZ_ACTIVE = True
+    uids = get_registered_users()
+    await update.message.reply_text(f"▶️ Запускаю викторину для {len(uids)} зарегистрированных пользователей.")
+
+    # Стартуем всем, у кого нет активной попытки
+    started = 0
+    for uid in uids:
+        s = st(uid)
+        if not s.started or s.finished:
+            try:
+                await update.get_bot().send_message(uid, "Организатор запустил викторину.")
+                await start_user_quiz(uid, ctx, COUNTDOWN)
+                started += 1
+            except Exception as e:
+                log.warning("Cannot start for %s: %s", uid, e)
+
+    await update.message.reply_text(f"Готово. Запущено попыток: {started}/{len(uids)}.")
 
 async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -295,26 +339,45 @@ async def cmd_setq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
 
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    with db() as conn:
+        rows = conn.execute("SELECT country, COUNT(*) FROM users WHERE country IS NOT NULL GROUP BY country").fetchall()
+    total = sum(r[1] for r in rows)
+    lines = [f"Всего зарегистрировано: {total}"]
+    for c, cnt in rows:
+        lines.append(f"- {c}: {cnt}")
+    await update.message.reply_text("\n".join(lines))
+
 # ---------- КНОПКИ ----------
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cq = update.callback_query
     data = cq.data or ""
+
     if data.startswith("set_country:"):
         country = data.split(":",1)[1]
         uid = cq.from_user.id
 
-        reset_user(uid)
+        # Запишем/обновим страну (не стартуем автоматически!)
         with db() as conn:
             conn.execute(
                 "INSERT INTO users(user_id,country) VALUES(?,?) "
-                "ON CONFLICT(user_id) DO UPDATE SET country=excluded.country", (uid, country)
+                "ON CONFLICT(user_id) DO UPDATE SET country=excluded.country",
+                (uid, country)
             )
-        try:
-            await cq.edit_message_text(f"Страна: {country}. Начинаем…")
-        except:
-            await cq.message.reply_text(f"Страна: {country}. Начинаем…")
 
-        await start_user_quiz(uid, ctx)
+        # Сбрасывать ответы НЕ будем — человек мог выбрать страну повторно.
+        # Если хочет заново — у него есть /again.
+        msg = (
+            f"Страна: {country} сохранена.\n"
+            f"Ожидайте старт от организатора. Время на каждый вопрос — {QUESTION_SECONDS} сек.\n"
+            f"Чтобы пройти заново позже: воспользуйтесь командой /again."
+        )
+        try:
+            await cq.edit_message_text(msg)
+        except:
+            await cq.message.reply_text(msg)
 
 # ---------- POLL ----------
 async def on_poll_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -339,25 +402,32 @@ async def on_poll_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def build_app() -> Application:
     load_questions_from_file()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("restart", cmd_restart))
-    app.add_handler(CommandHandler("report", cmd_report))
-    app.add_handler(CommandHandler("reload", cmd_reload))
-    app.add_handler(CommandHandler("setq", cmd_setq))
+
+    # Участник
+    app.add_handler(CommandHandler("start",  cmd_start))
+    app.add_handler(CommandHandler("again",  cmd_again))
+    app.add_handler(CommandHandler("help",   cmd_help))
+
+    # Админ
+    app.add_handler(CommandHandler("start_quiz", cmd_start_quiz))
+    app.add_handler(CommandHandler("report",     cmd_report))
+    app.add_handler(CommandHandler("reload",     cmd_reload))
+    app.add_handler(CommandHandler("setq",       cmd_setq))
+    app.add_handler(CommandHandler("status",     cmd_status))
+
+    # Кнопки + ответы на опросы
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(PollAnswerHandler(on_poll_answer))
     return app
 
 if __name__ == "__main__":
     application = build_app()
-    # ВЕБХУК: Tornado-сервер PTB слушает порт, Render видит, что порт занят — всё ок.
     log.info("Starting in WEBHOOK mode on port %s; PUBLIC_URL=%s", PORT, PUBLIC_URL)
     application.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        url_path=BOT_TOKEN,                        # скрытый путь
-        webhook_url=f"{PUBLIC_URL}/{BOT_TOKEN}",   # Telegram будет слать сюда
+        url_path=BOT_TOKEN,                         # скрытый путь
+        webhook_url=f"{PUBLIC_URL}/{BOT_TOKEN}",    # Telegram будет слать сюда
         drop_pending_updates=True,
         allowed_updates=["message","callback_query","poll_answer"]
     )
