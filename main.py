@@ -1,4 +1,5 @@
-# main.py — WEBHOOK для Render, админ запускает раунд, у участников салют по завершении
+# main.py — WEBHOOK для Render, админ запускает раунд,
+# у участников: мгновенная обратная связь + финальное личное резюме + салют 🎉
 import os, json, sqlite3, asyncio, time, logging
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Set, Tuple
@@ -47,9 +48,6 @@ COUNTRIES      = ["Россия", "Казахстан", "Армения", "Бе�
 QUESTION_SECONDS = 30
 COUNTDOWN         = 3
 
-# Глобальный флаг «идёт раунд» (если нужен в будущем)
-QUIZ_ACTIVE = False
-
 # ---------- МОДЕЛИ ----------
 @dataclass
 class Question:
@@ -78,7 +76,7 @@ def db():
     conn.execute("""CREATE TABLE IF NOT EXISTS answers(
         user_id INTEGER,
         q_index INTEGER,
-        option_ids TEXT,
+        option_ids TEXT,  -- JSON list[int]
         correct INTEGER
     )""")
     return conn
@@ -147,6 +145,69 @@ def reset_user(uid: int):
     with db() as conn:
         conn.execute("DELETE FROM answers WHERE user_id=?", (uid,))
 
+# ---------- УТИЛИТЫ ДЛЯ ОТЧЁТОВ УЧАСТНИКУ ----------
+def _fmt_opts(indices: List[int], options: List[str]) -> str:
+    if not indices:
+        return "—"
+    parts = []
+    for i in indices:
+        if 0 <= i < len(options):
+            parts.append(f"{chr(0x41+i)}. {options[i]}")  # A., B., C. ...
+    return "; ".join(parts)
+
+async def send_personal_summary(uid: int, ctx: ContextTypes.DEFAULT_TYPE):
+    """Финальная личная сводка участнику: правильные/неправильные/без ответа + поминутный список."""
+    total_q = len(QUESTIONS)
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT q_index, option_ids, correct FROM answers WHERE user_id=? ORDER BY q_index",
+            (uid,)
+        ).fetchall()
+
+    answered = len(rows)
+    correct_cnt = sum(1 for _, _, ok in rows if ok)
+    unanswered = total_q - answered
+    acc = round((correct_cnt / total_q * 100) if total_q else 0.0, 2)
+
+    # Краткая сводка
+    msg = (
+        f"📊 Ваша сводка:\n"
+        f"Всего вопросов: {total_q}\n"
+        f"Отвечено: {answered}\n"
+        f"Правильно: {correct_cnt}\n"
+        f"Без ответа: {unanswered}\n"
+        f"Точность: {acc}%"
+    )
+    await ctx.bot.send_message(uid, msg)
+
+    # Подробный список «ваш ответ → правильный»
+    lines = ["\n🧾 Разбор по вопросам:"]
+    for qidx, opt_json, ok in rows:
+        q = QUESTIONS[qidx]
+        chosen = []
+        try:
+            chosen = json.loads(opt_json) if opt_json else []
+        except:
+            chosen = []
+        chosen_text = _fmt_opts(chosen, q.options)
+        correct_text = _fmt_opts(q.correct, q.options)
+        mark = "✅" if ok else "❌"
+        lines.append(
+            f"{mark} Вопрос {qidx+1}: {q.text}\n"
+            f"— Ваш ответ: {chosen_text}\n"
+            f"— Правильно: {correct_text}\n"
+        )
+
+    # ТГ ограничивает длину сообщений, дробим при необходимости
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) > 3500:
+            await ctx.bot.send_message(uid, chunk)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk:
+        await ctx.bot.send_message(uid, chunk)
+
 # ---------- КВИЗ (личный чат) ----------
 async def start_user_quiz(uid: int, ctx: ContextTypes.DEFAULT_TYPE, countdown: int = COUNTDOWN):
     """Запустить попытку у конкретного пользователя (по админ-старту)."""
@@ -187,6 +248,11 @@ async def send_next(uid: int, ctx: ContextTypes.DEFAULT_TYPE):
                 await ctx.bot.send_animation(uid, CELEBRATION_GIF_URL)
             except Exception as e:
                 log.warning("Celebration gif failed: %s", e)
+        # Личная сводка
+        try:
+            await send_personal_summary(uid, ctx)
+        except Exception as e:
+            log.warning("Personal summary failed: %s", e)
         return
 
     q = QUESTIONS[s.index]
@@ -214,7 +280,7 @@ async def send_next(uid: int, ctx: ContextTypes.DEFAULT_TYPE):
 
     asyncio.create_task(q_timeout(msg.poll.id, uid))
 
-# ---------- ОТЧЁТ ----------
+# ---------- ОТЧЁТ ДЛЯ АДМИНА ----------
 async def export_results_file() -> str:
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -309,14 +375,12 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ---------- КОМАНДЫ (админ) ----------
 async def cmd_start_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """АДМИН: запустить для всех зарегистрированных, кто ещё не начал или уже сбросил."""
-    global QUIZ_ACTIVE
     if not is_admin(update.effective_user.id):
         return
     if not QUESTIONS:
         await update.message.reply_text("Нет загруженных вопросов. Используй /reload или /setq.")
         return
 
-    QUIZ_ACTIVE = True
     uids = get_registered_users()
     await update.message.reply_text(f"▶️ Запускаю викторину для {len(uids)} зарегистрированных пользователей.")
 
@@ -397,7 +461,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except:
             await cq.message.reply_text(msg)
 
-# ---------- POLL ----------
+# ---------- POLL (ответ участника) ----------
 async def on_poll_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ans = update.poll_answer
     uid = ans.user.id
@@ -408,11 +472,31 @@ async def on_poll_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = QUESTIONS[s.index]
     chosen = ans.option_ids or []
     correct = int(set(chosen) == set(q.correct))
+
+    # Сохраняем ответ в БД
     with db() as conn:
         conn.execute(
             "INSERT INTO answers(user_id,q_index,option_ids,correct) VALUES(?,?,?,?)",
             (uid, s.index, json.dumps(chosen, ensure_ascii=False), correct)
         )
+
+    # Мгновенная обратная связь участнику
+    chosen_text  = _fmt_opts(chosen,   q.options)
+    correct_text = _fmt_opts(q.correct, q.options)
+    if correct:
+        fb = f"✅ Верно!\nВаш ответ: {chosen_text}"
+    else:
+        fb = (
+            "❌ Неверно.\n"
+            f"Ваш ответ: {chosen_text}\n"
+            f"Правильные варианты: {correct_text}"
+        )
+    try:
+        await ctx.bot.send_message(uid, fb)
+    except Exception as e:
+        log.warning("Feedback send failed: %s", e)
+
+    # Следующий вопрос
     s.index += 1
     await send_next(uid, ctx)
 
