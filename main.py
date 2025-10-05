@@ -1,4 +1,4 @@
-# main.py — режим WEBHOOK для Render, админ запускает викторину
+# main.py — WEBHOOK для Render, админ запускает раунд, у участников салют по завершении
 import os, json, sqlite3, asyncio, time, logging
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Set, Tuple
@@ -23,6 +23,17 @@ PUBLIC_URL  = (os.getenv("PUBLIC_URL")  or "").strip().rstrip("/")
 PORT        = int(os.getenv("PORT", "10000"))
 ADMINS_ENV  = os.getenv("ADMINS", "")
 
+# Салют/поздравление после прохождения
+CELEBRATE = (os.getenv("CELEBRATE", "1").strip() == "1")
+CELEBRATION_GIF_URL = os.getenv(
+    "CELEBRATION_GIF_URL",
+    "https://media.giphy.com/media/111ebonMs90YLu/giphy.gif"
+)
+CELEBRATION_TEXT = os.getenv(
+    "CELEBRATION_TEXT",
+    "🎉 Поздравляем! Вы прошли викторину. Спасибо за участие! 🎆"
+)
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is empty (Settings → Environment).")
 if not PUBLIC_URL:
@@ -36,7 +47,7 @@ COUNTRIES      = ["Россия", "Казахстан", "Армения", "Бе�
 QUESTION_SECONDS = 30
 COUNTDOWN         = 3
 
-# Глобальный флаг «идёт раунд»
+# Глобальный флаг «идёт раунд» (если нужен в будущем)
 QUIZ_ACTIVE = False
 
 # ---------- МОДЕЛИ ----------
@@ -138,7 +149,7 @@ def reset_user(uid: int):
 
 # ---------- КВИЗ (личный чат) ----------
 async def start_user_quiz(uid: int, ctx: ContextTypes.DEFAULT_TYPE, countdown: int = COUNTDOWN):
-    """Запустить попытку у конкретного пользователя (если активен раунд)."""
+    """Запустить попытку у конкретного пользователя (по админ-старту)."""
     s = st(uid)
     if s.started and not s.finished:
         return
@@ -165,7 +176,17 @@ async def send_next(uid: int, ctx: ContextTypes.DEFAULT_TYPE):
     s = st(uid)
     if s.index >= len(QUESTIONS):
         s.finished = True
+        # Финальное сообщение + салют
         await ctx.bot.send_message(uid, "✅ Спасибо! Ваши ответы сохранены.")
+        if CELEBRATE:
+            try:
+                await ctx.bot.send_message(uid, CELEBRATION_TEXT)
+            except Exception as e:
+                log.warning("Celebration text failed: %s", e)
+            try:
+                await ctx.bot.send_animation(uid, CELEBRATION_GIF_URL)
+            except Exception as e:
+                log.warning("Celebration gif failed: %s", e)
         return
 
     q = QUESTIONS[s.index]
@@ -257,7 +278,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     kb = [[InlineKeyboardButton(c, callback_data=f"set_country:{c}") ] for c in COUNTRIES]
     await update.message.reply_text(
-        "Выберите страну. После выбора вы будете зарегистрированы и увидите сообщение: "
+        "Выберите страну. После выбора вы будете зарегистрированы и увидите: "
         "«Ожидайте старт от организатора». Админ запустит викторину для всех зарегистрированных.",
         reply_markup=InlineKeyboardMarkup(kb)
     )
@@ -299,7 +320,6 @@ async def cmd_start_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uids = get_registered_users()
     await update.message.reply_text(f"▶️ Запускаю викторину для {len(uids)} зарегистрированных пользователей.")
 
-    # Стартуем всем, у кого нет активной попытки
     started = 0
     for uid in uids:
         s = st(uid)
@@ -367,12 +387,10 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 (uid, country)
             )
 
-        # Сбрасывать ответы НЕ будем — человек мог выбрать страну повторно.
-        # Если хочет заново — у него есть /again.
         msg = (
             f"Страна: {country} сохранена.\n"
             f"Ожидайте старт от организатора. Время на каждый вопрос — {QUESTION_SECONDS} сек.\n"
-            f"Чтобы пройти заново позже: воспользуйтесь командой /again."
+            f"Чтобы пройти заново позже: используйте /again."
         )
         try:
             await cq.edit_message_text(msg)
