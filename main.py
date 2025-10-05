@@ -1,5 +1,13 @@
-# main.py — WEBHOOK для Render, админ запускает раунд,
-# у участников: мгновенная обратная связь + финальное личное резюме + салют 🎉
+# main.py — WEBHOOK для Render
+# Функции:
+# - Админ запускает раунд (кнопка /admin → ▶️ Старт)
+# - 30 секунд на ответ (QUESTION_SECONDS=30)
+# - Мгновенная обратная связь участнику (верно/неверно + правильные)
+# - Финальное личное резюме + "салют" (GIF/текст)
+# - Excel-отчёт для админа
+# - Полный сброс данных (админ-кнопка "🗑 Сбросить всё" с подтверждением)
+# - Админ-панель с кнопками управления (/admin)
+
 import os, json, sqlite3, asyncio, time, logging
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Set, Tuple
@@ -45,7 +53,7 @@ ADMIN_IDS = {int(x) for x in ADMINS_ENV.split(",") if x.strip().isdigit()} or {1
 DB_FILE        = "quiz.db"
 QUESTIONS_FILE = "questions.json"
 COUNTRIES      = ["Россия", "Казахстан", "Армения", "Беларусь", "Кыргызстан"]
-QUESTION_SECONDS = 30
+QUESTION_SECONDS = 30   # ⏱️ время на вопрос — 30 секунд
 COUNTDOWN         = 3
 
 # ---------- МОДЕЛИ ----------
@@ -145,6 +153,13 @@ def reset_user(uid: int):
     with db() as conn:
         conn.execute("DELETE FROM answers WHERE user_id=?", (uid,))
 
+def reset_all():
+    """Полный сброс: ответы, регистрация стран, состояние."""
+    STATE.clear()
+    with db() as conn:
+        conn.execute("DELETE FROM answers")
+        conn.execute("DELETE FROM users")
+
 # ---------- УТИЛИТЫ ДЛЯ ОТЧЁТОВ УЧАСТНИКУ ----------
 def _fmt_opts(indices: List[int], options: List[str]) -> str:
     if not indices:
@@ -156,7 +171,6 @@ def _fmt_opts(indices: List[int], options: List[str]) -> str:
     return "; ".join(parts)
 
 async def send_personal_summary(uid: int, ctx: ContextTypes.DEFAULT_TYPE):
-    """Финальная личная сводка участнику: правильные/неправильные/без ответа + поминутный список."""
     total_q = len(QUESTIONS)
     with db() as conn:
         rows = conn.execute(
@@ -169,7 +183,6 @@ async def send_personal_summary(uid: int, ctx: ContextTypes.DEFAULT_TYPE):
     unanswered = total_q - answered
     acc = round((correct_cnt / total_q * 100) if total_q else 0.0, 2)
 
-    # Краткая сводка
     msg = (
         f"📊 Ваша сводка:\n"
         f"Всего вопросов: {total_q}\n"
@@ -180,16 +193,14 @@ async def send_personal_summary(uid: int, ctx: ContextTypes.DEFAULT_TYPE):
     )
     await ctx.bot.send_message(uid, msg)
 
-    # Подробный список «ваш ответ → правильный»
     lines = ["\n🧾 Разбор по вопросам:"]
     for qidx, opt_json, ok in rows:
         q = QUESTIONS[qidx]
-        chosen = []
         try:
             chosen = json.loads(opt_json) if opt_json else []
         except:
             chosen = []
-        chosen_text = _fmt_opts(chosen, q.options)
+        chosen_text  = _fmt_opts(chosen, q.options)
         correct_text = _fmt_opts(q.correct, q.options)
         mark = "✅" if ok else "❌"
         lines.append(
@@ -198,7 +209,6 @@ async def send_personal_summary(uid: int, ctx: ContextTypes.DEFAULT_TYPE):
             f"— Правильно: {correct_text}\n"
         )
 
-    # ТГ ограничивает длину сообщений, дробим при необходимости
     chunk = ""
     for line in lines:
         if len(chunk) + len(line) > 3500:
@@ -210,7 +220,6 @@ async def send_personal_summary(uid: int, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ---------- КВИЗ (личный чат) ----------
 async def start_user_quiz(uid: int, ctx: ContextTypes.DEFAULT_TYPE, countdown: int = COUNTDOWN):
-    """Запустить попытку у конкретного пользователя (по админ-старту)."""
     s = st(uid)
     if s.started and not s.finished:
         return
@@ -237,7 +246,7 @@ async def send_next(uid: int, ctx: ContextTypes.DEFAULT_TYPE):
     s = st(uid)
     if s.index >= len(QUESTIONS):
         s.finished = True
-        # Финальное сообщение + салют
+        # Финал + салют + личная сводка
         await ctx.bot.send_message(uid, "✅ Спасибо! Ваши ответы сохранены.")
         if CELEBRATE:
             try:
@@ -248,7 +257,6 @@ async def send_next(uid: int, ctx: ContextTypes.DEFAULT_TYPE):
                 await ctx.bot.send_animation(uid, CELEBRATION_GIF_URL)
             except Exception as e:
                 log.warning("Celebration gif failed: %s", e)
-        # Личная сводка
         try:
             await send_personal_summary(uid, ctx)
         except Exception as e:
@@ -332,9 +340,94 @@ async def export_results_file() -> str:
     for col in ws3.columns:
         ws3.column_dimensions[get_column_letter(col[0].column)].width = 18
 
-    path = f"results_{int(time.time())}.xlsx"
+    path = f"results_%d.xlsx" % int(time.time())
     wb.save(path)
     return path
+
+# ---------- КНОПКИ ДЛЯ АДМИНА ----------
+def admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ Старт викторины", callback_data="admin:start")],
+        [
+            InlineKeyboardButton("📄 Отчёт (Excel)", callback_data="admin:report"),
+            InlineKeyboardButton("📊 Статус",        callback_data="admin:status"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Перечитать вопросы", callback_data="admin:reload"),
+        ],
+        [
+            InlineKeyboardButton("🗑 Сбросить всё", callback_data="admin:reset"),
+        ],
+    ])
+
+async def on_admin_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cq = update.callback_query
+    uid = cq.from_user.id
+    if not is_admin(uid):
+        await cq.answer("Недостаточно прав.")
+        return
+    data = cq.data or ""
+    if data == "admin:start":
+        # Старт как /start_quiz
+        try:
+            msg = await cq.edit_message_text("▶️ Запускаю…")
+        except:
+            msg = await cq.message.reply_text("▶️ Запускаю…")
+        # выполняем запуск
+        started = 0
+        if not QUESTIONS:
+            await cq.message.reply_text("Нет загруженных вопросов. Используй /reload или /setq.")
+            return
+        uids = get_registered_users()
+        await cq.message.reply_text(f"Старт для {len(uids)} пользователей.")
+        for u in uids:
+            s = st(u)
+            if not s.started or s.finished:
+                try:
+                    await ctx.bot.send_message(u, "Организатор запустил викторину.")
+                    await start_user_quiz(u, ctx, COUNTDOWN)
+                    started += 1
+                except Exception as e:
+                    log.warning("Cannot start for %s: %s", u, e)
+        await cq.message.reply_text(f"Готово. Запущено: {started}/{len(uids)}.")
+        # Вернём панель
+        await cq.message.reply_text("Панель:", reply_markup=admin_keyboard())
+
+    elif data == "admin:report":
+        await cq.answer("Формирую отчёт…")
+        path = await export_results_file()
+        await ctx.bot.send_document(uid, open(path, "rb"), filename=os.path.basename(path))
+        await cq.message.reply_text("Панель:", reply_markup=admin_keyboard())
+
+    elif data == "admin:status":
+        with db() as conn:
+            rows = conn.execute("SELECT country, COUNT(*) FROM users WHERE country IS NOT NULL GROUP BY country").fetchall()
+        total = sum(r[1] for r in rows)
+        lines = [f"Всего зарегистрировано: {total}"]
+        for c, cnt in rows:
+            lines.append(f"- {c}: {cnt}")
+        await cq.message.reply_text("\n".join(lines), reply_markup=admin_keyboard())
+
+    elif data == "admin:reload":
+        n = load_questions_from_file()
+        await cq.message.reply_text(f"Перечитал {QUESTIONS_FILE}: вопросов {n}.", reply_markup=admin_keyboard())
+
+    elif data == "admin:reset":
+        # Подтверждение
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Да, очистить всё", callback_data="admin:reset_confirm"),
+                InlineKeyboardButton("❌ Отмена",            callback_data="admin:reset_cancel"),
+            ]
+        ])
+        await cq.message.reply_text("Вы уверены, что хотите полностью очистить регистрации и ответы?", reply_markup=kb)
+
+    elif data == "admin:reset_confirm":
+        reset_all()
+        await cq.message.reply_text("✅ Всё очищено. Участникам нужно снова выбрать страну в /start.", reply_markup=admin_keyboard())
+
+    elif data == "admin:reset_cancel":
+        await cq.message.reply_text("Отменено.", reply_markup=admin_keyboard())
 
 # ---------- КОМАНДЫ (участник) ----------
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -365,6 +458,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/start — регистрация (выбор страны) и ожидание старта\n"
         "/again — сброс своей попытки\n\n"
         "Админ:\n"
+        "/admin — панель управления кнопками\n"
         "/start_quiz — запустить викторину для всех зарегистрированных\n"
         "/report — Excel-отчёт\n"
         "/reload — перечитать questions.json\n"
@@ -372,18 +466,20 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/status — зарегистрированные пользователи по странам"
     )
 
-# ---------- КОМАНДЫ (админ) ----------
+# ---------- КОМАНДЫ (админ — текстовые, оставлены как альтернатива кнопкам) ----------
+async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    await update.message.reply_text("Панель управления:", reply_markup=admin_keyboard())
+
 async def cmd_start_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """АДМИН: запустить для всех зарегистрированных, кто ещё не начал или уже сбросил."""
     if not is_admin(update.effective_user.id):
         return
     if not QUESTIONS:
         await update.message.reply_text("Нет загруженных вопросов. Используй /reload или /setq.")
         return
-
     uids = get_registered_users()
     await update.message.reply_text(f"▶️ Запускаю викторину для {len(uids)} зарегистрированных пользователей.")
-
     started = 0
     for uid in uids:
         s = st(uid)
@@ -394,7 +490,6 @@ async def cmd_start_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 started += 1
             except Exception as e:
                 log.warning("Cannot start for %s: %s", uid, e)
-
     await update.message.reply_text(f"Готово. Запущено попыток: {started}/{len(uids)}.")
 
 async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -434,7 +529,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"- {c}: {cnt}")
     await update.message.reply_text("\n".join(lines))
 
-# ---------- КНОПКИ ----------
+# ---------- КНОПКИ (участник) ----------
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cq = update.callback_query
     data = cq.data or ""
@@ -442,15 +537,12 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data.startswith("set_country:"):
         country = data.split(":",1)[1]
         uid = cq.from_user.id
-
-        # Запишем/обновим страну (не стартуем автоматически!)
         with db() as conn:
             conn.execute(
                 "INSERT INTO users(user_id,country) VALUES(?,?) "
                 "ON CONFLICT(user_id) DO UPDATE SET country=excluded.country",
                 (uid, country)
             )
-
         msg = (
             f"Страна: {country} сохранена.\n"
             f"Ожидайте старт от организатора. Время на каждый вопрос — {QUESTION_SECONDS} сек.\n"
@@ -473,30 +565,24 @@ async def on_poll_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chosen = ans.option_ids or []
     correct = int(set(chosen) == set(q.correct))
 
-    # Сохраняем ответ в БД
     with db() as conn:
         conn.execute(
             "INSERT INTO answers(user_id,q_index,option_ids,correct) VALUES(?,?,?,?)",
             (uid, s.index, json.dumps(chosen, ensure_ascii=False), correct)
         )
 
-    # Мгновенная обратная связь участнику
-    chosen_text  = _fmt_opts(chosen,   q.options)
-    correct_text = _fmt_opts(q.correct, q.options)
+    # Мгновенная обратная связь
+    def fmt(indices: List[int]) -> str:
+        return _fmt_opts(indices, q.options)
     if correct:
-        fb = f"✅ Верно!\nВаш ответ: {chosen_text}"
+        fb = f"✅ Верно!\nВаш ответ: {fmt(chosen)}"
     else:
-        fb = (
-            "❌ Неверно.\n"
-            f"Ваш ответ: {chosen_text}\n"
-            f"Правильные варианты: {correct_text}"
-        )
+        fb = "❌ Неверно.\n" + f"Ваш ответ: {fmt(chosen)}\n" + f"Правильные варианты: {fmt(q.correct)}"
     try:
         await ctx.bot.send_message(uid, fb)
     except Exception as e:
         log.warning("Feedback send failed: %s", e)
 
-    # Следующий вопрос
     s.index += 1
     await send_next(uid, ctx)
 
@@ -510,14 +596,16 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("again",  cmd_again))
     app.add_handler(CommandHandler("help",   cmd_help))
 
-    # Админ
+    # Админ (кнопочная панель + текстовые команды)
+    app.add_handler(CommandHandler("admin",      cmd_admin))
+    app.add_handler(CallbackQueryHandler(on_admin_button, pattern=r"^admin:"))
     app.add_handler(CommandHandler("start_quiz", cmd_start_quiz))
     app.add_handler(CommandHandler("report",     cmd_report))
     app.add_handler(CommandHandler("reload",     cmd_reload))
     app.add_handler(CommandHandler("setq",       cmd_setq))
     app.add_handler(CommandHandler("status",     cmd_status))
 
-    # Кнопки + ответы на опросы
+    # Кнопки участника + ответы на опросы
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(PollAnswerHandler(on_poll_answer))
     return app
