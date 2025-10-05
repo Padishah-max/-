@@ -1,3 +1,6 @@
 python-telegram-bot[webhooks]==21.6
 openpyxl==3.1.5
 httpx==0.28.1
+CELEBRATE   = 1  
+CELEBRATION_GIF_URL = https://media.giphy.com/media/111ebonMs90YLu/giphy.gif
+CELEBRATION_TEXT    = 🎉 Поздравляем! Вы прошли викторину. Спасибо за участие! 🎆
